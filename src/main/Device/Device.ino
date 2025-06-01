@@ -20,10 +20,6 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 
-// WiFi credentials
-// #define WIFI_SSID "SAMURAI@CREEDS_2.4G"
-// #define WIFI_PASSWORD "samurai1@creeds"
-
 // Firebase credentials
 #define Web_API_KEY "AIzaSyAaiE2hCxCOIzy39Gq_BW8KlD_bUSR6Tyw"
 #define DATABASE_URL "https://esp-gas-ai-default-rtdb.asia-southeast1.firebasedatabase.app"
@@ -68,7 +64,7 @@ String storedPassword = "";
 #define TARE_VALUE_ADDR 104         // 4 bytes for float (104–107)
 #define CALIBRATION_VALID_ADDR 108  // 1 byte for calibration valid flag (108)
 
-bool isDB = false;
+bool isDB = true;
 
 WebServer server(80);
 DNSServer dnsServer;
@@ -80,6 +76,8 @@ WiFiClientSecure ssl_client;
 using AsyncClient = AsyncClientClass;
 AsyncClient aClient(ssl_client);
 RealtimeDatabase Database;
+
+SemaphoreHandle_t cachedDataMutex;
 
 SemaphoreHandle_t sensorDataMutex;
 QueueHandle_t sensorDataQueue;
@@ -495,18 +493,6 @@ private:
     }
   }
 
-  HX711_Data getProtectedWeight()
-  {
-    HX711_Data data;
-    if (xSemaphoreTake(sensorDataMutex, portMAX_DELAY) == pdTRUE)
-    {
-      data.weight = protectedCurrentWeight;
-      data.isValid = protectedWeightDataReady;
-      xSemaphoreGive(sensorDataMutex);
-    }
-    return data;
-  }
-
   void calibrateMQ6()
   {
     float val = 0;
@@ -854,16 +840,24 @@ public:
     data.mq6 = readMQ6();
     data.mq7 = readMQ7();
     data.mics4514 = readMICS4514();
-    data.hx711 = getProtectedWeight(); // Get thread-safe weight data
+    data.hx711 = readHX711(); // Get thread-safe weight data
   }
 
-  HX711_Data getCurrentWeight()
+  HX711_Data getProtectedWeight()
   {
-    return getProtectedWeight();
+    HX711_Data data;
+    if (xSemaphoreTake(sensorDataMutex, portMAX_DELAY) == pdTRUE)
+    {
+      data.weight = protectedCurrentWeight;
+      data.isValid = protectedWeightDataReady;
+      xSemaphoreGive(sensorDataMutex);
+    }
+    return data;
   }
 };
 
 SensorManager sensorManager;
+CombinedSensorData cachedSensorData;
 
 void processData(AsyncResult &aResult)
 {
@@ -976,6 +970,7 @@ void pushToDatabase(const String &path, JsonDocument &jsonData, const String &ta
 
 void firebaseTask(void *parameter)
 {
+  Serial.println("................................FireFireFireFireFireFireFireFireFireFireFireFireFireFireFireFireFireFire");
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xFrequency = pdMS_TO_TICKS(30000); // 30 seconds
 
@@ -984,7 +979,19 @@ void firebaseTask(void *parameter)
     if (app.ready())
     {
       CombinedSensorData data;
-      sensorManager.readAllSensors(data);
+
+      // Get cached sensor data with mutex protection
+      if (xSemaphoreTake(cachedDataMutex, pdMS_TO_TICKS(500)) == pdTRUE)
+      {
+        data = cachedSensorData;
+        xSemaphoreGive(cachedDataMutex);
+      }
+      else
+      {
+        Serial.println("Failed to get cached sensor data for Firebase push");
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        continue;
+      }
 
       // BME680
       {
@@ -1000,7 +1007,7 @@ void firebaseTask(void *parameter)
         }
       }
 
-      // PMS7003
+      // PMS7003 - Always push cached data (should be valid from last good reading)
       {
         StaticJsonDocument<256> pmsData;
         pmsData["pm1_0"] = data.pms7003.pm1_0;
@@ -1016,6 +1023,9 @@ void firebaseTask(void *parameter)
         {
           pushToDatabase("/sensor_data/pms7003", pmsData, "PMS7003_PUSH");
         }
+        Serial.println("Pushed cached PMS7003 data: PM2.5=" + String(data.pms7003.pm2_5) +
+                       ", PM10=" + String(data.pms7003.pm10) +
+                       ", Valid=" + String(data.pms7003.isValid ? "Yes" : "No"));
       }
 
       // MQ6
@@ -1099,6 +1109,25 @@ void serialPrintTask(void *parameter)
     // Wait for sensor data from queue
     if (xQueueReceive(sensorDataQueue, &receivedData, portMAX_DELAY) == pdTRUE)
     {
+      // Update global cache with mutex protection
+      if (xSemaphoreTake(cachedDataMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+      {
+        // Only update cache with valid PMS7003 data, keep previous if invalid
+        if (receivedData.pms7003.isValid)
+        {
+          cachedSensorData.pms7003 = receivedData.pms7003;
+        }
+
+        // Always update other sensors (assuming they're always valid or have their own validation)
+        cachedSensorData.bme680 = receivedData.bme680;
+        cachedSensorData.mq6 = receivedData.mq6;
+        cachedSensorData.mq7 = receivedData.mq7;
+        cachedSensorData.mics4514 = receivedData.mics4514;
+        cachedSensorData.hx711 = receivedData.hx711;
+
+        xSemaphoreGive(cachedDataMutex);
+      }
+
       // Print sensor readings to console
       Serial.println("========== SENSOR READINGS ==========");
 
@@ -1114,6 +1143,10 @@ void serialPrintTask(void *parameter)
       {
         Serial.printf("PMS7003 - PM1.0: %d, PM2.5: %d, PM10: %d μg/m³\n",
                       receivedData.pms7003.pm1_0, receivedData.pms7003.pm2_5, receivedData.pms7003.pm10);
+      }
+      else
+      {
+        Serial.println("PMS7003 - Invalid reading, using cached data for Firebase");
       }
 
       if (receivedData.mq6.isValid)
@@ -1141,6 +1174,19 @@ void serialPrintTask(void *parameter)
       Serial.println("=====================================");
     }
   }
+}
+
+void initializeGlobalCache()
+{
+  // Create mutex for cached data protection
+  cachedDataMutex = xSemaphoreCreateMutex();
+  if (cachedDataMutex == NULL)
+  {
+    Serial.println("Failed to create cached data mutex!");
+  }
+
+  // Initialize cached data with default values
+  memset(&cachedSensorData, 0, sizeof(CombinedSensorData));
 }
 
 bool loadWiFiCredentials()
@@ -1501,6 +1547,7 @@ void setup()
 
   sensorManager.checkForCalibrationRequest();
   sensorManager.printCalibrationInfo();
+  initializeGlobalCache();
 
   Serial.println("Warming up sensors...");
   delay(8000);
@@ -1552,7 +1599,7 @@ void setup()
   }
 
   // This code only runs if WiFi connected with saved credentials
-  Serial.println("WiFi connected successfully!");
+  Serial.println("WiFi connected successfully.................................................!");
 
   // Initialize NTP and Firebase
   timeClient.begin();
@@ -1569,7 +1616,7 @@ void setup()
   ssl_client.setConnectionTimeout(5000);
   ssl_client.setHandshakeTimeout(3000);
 
-  Serial.println("Firebase Starting initialization...");
+  Serial.println("Firebase Starting initialization........................");
   initializeApp(aClient, app, getAuth(user_auth), processData, "🔐Firebase authTask");
   app.getApp<RealtimeDatabase>(Database);
   Database.url(DATABASE_URL);
@@ -1595,7 +1642,7 @@ void loop()
   dnsServer.processNextRequest(); // Handle DNS requests for captive portal
 
   // Keep Firebase app loop running on main thread (only if connected)
-  if (WiFi.status() == WL_CONNECTED && WiFi.getMode() != WIFI_AP)
+  if (WiFi.status() == WL_CONNECTED)
   {
     app.loop();
   }

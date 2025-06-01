@@ -20,8 +20,8 @@
 #include "freertos/queue.h"
 
 // WiFi credentials
-// #define WIFI_SSID "SAMURAI@CREEDS_2.4G"
-// #define WIFI_PASSWORD "samurai1@creeds"
+#define WIFI_SSID "SAMURAI@CREEDS_2.4G"
+#define WIFI_PASSWORD "samurai1@creeds"
 
 // Firebase credentials
 #define Web_API_KEY "AIzaSyAaiE2hCxCOIzy39Gq_BW8KlD_bUSR6Tyw"
@@ -55,14 +55,10 @@
 #define MQ7_RO_CLEAN_AIR_FACTOR 27.0
 #define HX711_CALIBRATION_FACTOR -2689.7 // -21667.333984  // -20933.333984  -37170.00
 
-// EEPROM addresses
-#define EEPROM_SIZE 512
-#define SSID_ADDR 0                 // 32 bytes for SSID (0–31)
-#define PASS_ADDR 32                // 64 bytes for password (32–95)
-#define CONFIG_FLAG_ADDR 96         // 1 byte for config flag (96)
-#define CALIBRATION_FACTOR_ADDR 100 // 4 bytes for float (100–103)
-#define TARE_VALUE_ADDR 104         // 4 bytes for float (104–107)
-#define CALIBRATION_VALID_ADDR 108  // 1 byte for calibration valid flag (108)
+#define EEPROM_SIZE 64
+#define CALIBRATION_FACTOR_ADDR 0
+#define TARE_VALUE_ADDR 8
+#define CALIBRATION_VALID_ADDR 16
 
 bool isDB = false;
 
@@ -1139,12 +1135,11 @@ void serialPrintTask(void *parameter)
 
 bool loadWiFiCredentials()
 {
-  // Check if config flag is set (0xFF means no config saved)
-  if (EEPROM.read(CONFIG_FLAG_ADDR) == 0xFF)
+  if (EEPROM.read(CONFIG_FLAG_ADDR) != 0xFF)
   {
-    return false; // No credentials saved
+    return false;
   }
-  return true; // Credentials are saved
+  return true;
 }
 
 String readStringFromEEPROM(int addr, int maxLen)
@@ -1300,15 +1295,20 @@ void handleConnect()
       // Save credentials
       writeStringToEEPROM(SSID_ADDR, ssid, 32);
       writeStringToEEPROM(PASS_ADDR, password, 64);
-      EEPROM.write(CONFIG_FLAG_ADDR, 0xAA); // Use 0xAA to indicate valid config
+      EEPROM.write(CONFIG_FLAG_ADDR, 0xFF);
       EEPROM.commit();
 
       Serial.println("\nWiFi connected and credentials saved!");
       Serial.print("IP address: ");
       Serial.println(WiFi.localIP());
 
+      // Initialize sensor after successful WiFi connection
+      initializeSensor();
+
       // Configure time and authenticate Firebase
       configTime(0, 0, "pool.ntp.org");
+      authenticateFirebase();
+
       server.send(200, "application/json", "{\"success\":true,\"message\":\"Connected successfully! Device will restart in 3 seconds...\"}");
 
       delay(3000);
@@ -1384,16 +1384,11 @@ void setup()
   // Print current calibration info
   sensorManager.printCalibrationInfo();
 
-  // WiFi connection logic
-  bool wifiConnected = false;
+  // ///////////////////////////////////////////////
   if (loadWiFiCredentials())
   {
     Serial.println("Attempting connection with saved credentials...");
-    if (connectToWiFi())
-    {
-      wifiConnected = true;
-    }
-    else
+    if (!connectToWiFi())
     {
       Serial.println("Saved credentials failed, starting AP mode...");
       startAPMode();
@@ -1404,80 +1399,86 @@ void setup()
     Serial.println("No saved credentials, starting AP mode...");
     startAPMode();
   }
+  // ///////////////////////////////////////////////
 
-  // Only initialize NTP and Firebase if connected to WiFi
-  if (wifiConnected)
+  // WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // Serial.print("Connecting to Wi-Fi");
+  // while (WiFi.status() != WL_CONNECTED)
+  // {
+  //   Serial.print(".");
+  //   delay(300);
+  // }
+  // Serial.println();
+  // Serial.print("Connected with IP: ");
+  // Serial.println(WiFi.localIP());
+
+  // Initialize NTP client
+  timeClient.begin();
+  Serial.println("Connecting to NTP server...");
+  while (!timeClient.update())
   {
-    // Initialize NTP client
-    timeClient.begin();
-    Serial.println("Connecting to NTP server...");
-    while (!timeClient.update())
-    {
-      Serial.print(".");
-      timeClient.forceUpdate();
-      delay(500);
-    }
-    Serial.println("\nNTP time synchronized");
-
-    ssl_client.setInsecure();
-    ssl_client.setConnectionTimeout(5000);
-    ssl_client.setHandshakeTimeout(3000);
-
-    initializeApp(aClient, app, getAuth(user_auth), processData, "🔐 authTask");
-    app.getApp<RealtimeDatabase>(Database);
-    Database.url(DATABASE_URL);
-
-    Serial.println("Firebase initialization complete");
-
-    Serial.println("Warming up sensors...");
-    delay(20000);
-    Serial.println("Sensors ready");
-
-    // Create FreeRTOS tasks for normal operation
-    xTaskCreatePinnedToCore(
-        sensorReadTask,        // Task function
-        "SensorRead",          // Task name
-        4096,                  // Stack size
-        &sensorManager,        // Parameter
-        2,                     // Priority (higher for sensor reading)
-        &sensorReadTaskHandle, // Task handle
-        0                      // Core 0
-    );
-
-    xTaskCreatePinnedToCore(
-        firebaseTask,        // Task function
-        "FirebaseTask",      // Task name
-        8192,                // Stack size (larger for network operations)
-        NULL,                // Parameter
-        1,                   // Priority (lower than sensor reading)
-        &firebaseTaskHandle, // Task handle
-        1                    // Core 1
-    );
-
-    xTaskCreatePinnedToCore(
-        serialPrintTask,        // Task function
-        "SerialPrint",          // Task name
-        3072,                   // Stack size
-        NULL,                   // Parameter
-        1,                      // Priority
-        &serialPrintTaskHandle, // Task handle
-        0                       // Core 0
-    );
-
-    Serial.println("FreeRTOS tasks created successfully");
+    Serial.print(".");
+    timeClient.forceUpdate();
+    delay(500);
   }
-  else
+  Serial.println("\nNTP time synchronized");
+
+  if (!sensorManager.begin())
   {
-    Serial.println("Running in AP mode - connect to configure WiFi");
-    Serial.println("Access web interface at: http://192.168.4.1");
+    Serial.println("Failed to initialize some sensors!");
   }
 
+  ssl_client.setInsecure();
+  ssl_client.setConnectionTimeout(5000);
+  ssl_client.setHandshakeTimeout(3000);
+
+  initializeApp(aClient, app, getAuth(user_auth), processData, "🔐 authTask");
+  app.getApp<RealtimeDatabase>(Database);
+  Database.url(DATABASE_URL);
+
+  Serial.println("Firebase initialization complete");
+
+  Serial.println("Warming up sensors...");
+  delay(20000);
+  Serial.println("Sensors ready");
+
+  // Create FreeRTOS tasks
+  xTaskCreatePinnedToCore(
+      sensorReadTask,        // Task function
+      "SensorRead",          // Task name
+      4096,                  // Stack size
+      &sensorManager,        // Parameter
+      2,                     // Priority (higher for sensor reading)
+      &sensorReadTaskHandle, // Task handle
+      0                      // Core 0
+  );
+
+  xTaskCreatePinnedToCore(
+      firebaseTask,        // Task function
+      "FirebaseTask",      // Task name
+      8192,                // Stack size (larger for network operations)
+      NULL,                // Parameter
+      1,                   // Priority (lower than sensor reading)
+      &firebaseTaskHandle, // Task handle
+      1                    // Core 1
+  );
+
+  xTaskCreatePinnedToCore(
+      serialPrintTask,        // Task function
+      "SerialPrint",          // Task name
+      3072,                   // Stack size
+      NULL,                   // Parameter
+      1,                      // Priority
+      &serialPrintTaskHandle, // Task handle
+      0                       // Core 0
+  );
+
+  Serial.println("FreeRTOS tasks created successfully");
   Serial.println("System ready! Send 't' for manual tare, 'i' for calibration info");
 }
 
 void loop()
 {
-  server.handleClient();
   // Keep Firebase app loop running on main thread
   app.loop();
 

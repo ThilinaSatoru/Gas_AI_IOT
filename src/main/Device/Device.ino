@@ -1419,7 +1419,7 @@ void setup()
   xTaskCreatePinnedToCore(
       sensorReadTask,        // Task function
       "SensorRead",          // Task name
-      4096,                  // Stack size
+      8192,                  // Stack size
       &sensorManager,        // Parameter
       2,                     // Priority (higher for sensor reading)
       &sensorReadTaskHandle, // Task handle
@@ -1429,7 +1429,7 @@ void setup()
   xTaskCreatePinnedToCore(
       firebaseTask,        // Task function
       "FirebaseTask",      // Task name
-      8192,                // Stack size (larger for network operations)
+      16384,               // Stack size (larger for network operations)
       NULL,                // Parameter
       1,                   // Priority (lower than sensor reading)
       &firebaseTaskHandle, // Task handle
@@ -1439,15 +1439,27 @@ void setup()
   xTaskCreatePinnedToCore(
       serialPrintTask,        // Task function
       "SerialPrint",          // Task name
-      3072,                   // Stack size
+      4096,                   // Stack size
       NULL,                   // Parameter
       1,                      // Priority
       &serialPrintTaskHandle, // Task handle
       0                       // Core 0
   );
 
+  if (sensorDataMutex == NULL || sensorDataQueue == NULL ||
+      sensorReadTaskHandle == NULL || firebaseTaskHandle == NULL ||
+      serialPrintTaskHandle == NULL)
+  {
+    Serial.println("Failed to create FreeRTOS objects!");
+    while (1)
+      ;
+  }
+
   Serial.println("FreeRTOS tasks created successfully");
   Serial.println("System ready! Send 't' for manual tare, 'i' for calibration info");
+  Serial.printf("Free heap: %d, Min free heap: %d\n",
+                ESP.getFreeHeap(), ESP.getMinFreeHeap());
+  delay(1000);
 }
 
 void loop()

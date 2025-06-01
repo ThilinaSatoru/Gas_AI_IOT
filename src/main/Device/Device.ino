@@ -13,20 +13,55 @@
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 
+#include <WiFi.h>
+#include <AsyncTCP.h>
+// #include <ESPAsyncWebServer.h>
+#include <WebServer.h>
+#include <ElegantOTA.h>
+
+#include <DNSServer.h>
+#include <SPIFFS.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 
-// WiFi credentials
-#define WIFI_SSID "SAMURAI@CREEDS_2.4G"
-#define WIFI_PASSWORD "samurai1@creeds"
+// WiFi credentials /////////////////////////////////////////////////////////////////
+// #define WIFI_SSID "SAMURAI@CREEDS_2.4G"
+// #define WIFI_PASSWORD "samurai1@creeds"
 
-// Firebase credentials
-#define Web_API_KEY "AIzaSyAaiE2hCxCOIzy39Gq_BW8KlD_bUSR6Tyw"
-#define DATABASE_URL "https://esp-gas-ai-default-rtdb.asia-southeast1.firebasedatabase.app"
-#define USER_EMAIL "satoru.thilina@gmail.com"
-#define USER_PASS "123456"
+// WiFi Manager Configuration
+const char* AP_SSID = "ESP32_Setup";
+const char* AP_PASSWORD = "12345678";
+const char* WIFI_FILE = "/wifi_credentials.json";
+const int LED_PIN = 2; // Onboard LED
+const int MAX_NETWORKS = 20;
+
+
+// Function declarations
+bool loadWiFiCredentials(String &ssid, String &password);
+void saveWiFiCredentials(const String &ssid, const String &password);
+void setupWiFiAP();
+void setupServer();
+bool connectToWiFi(const String &ssid, const String &password);
+void readSensorData();
+String getWifiNetworkList();
+//////////////////////////////////////////////////////////////////////////////////////////
+
+// Captive Portal
+const byte DNS_PORT = 53;
+IPAddress apIP(192, 168, 4, 1);
+
+// Web Server
+// AsyncWebServer server(80);
+WebServer server(80);
+DNSServer dnsServer;
+bool wifiConnected = false;
+unsigned long lastConnectionAttempt = 0;
+const unsigned long connectionTimeout = 30000;
+
+
 
 // BME680 (SPI)
 #define BME_CS           5     // GPIO5 for - (CS)
@@ -59,15 +94,23 @@
 #define TARE_VALUE_ADDR 8
 #define CALIBRATION_VALID_ADDR 16
 
+
+// Firebase credentials //////////////////////////////////////////////////////////////////////////
 bool isDB = false;
+#define Web_API_KEY "AIzaSyAaiE2hCxCOIzy39Gq_BW8KlD_bUSR6Tyw"
+#define DATABASE_URL "https://esp-gas-ai-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define USER_EMAIL "satoru.thilina@gmail.com"
+#define USER_PASS "123456"
 
 // Firebase components
 UserAuth user_auth(Web_API_KEY, USER_EMAIL, USER_PASS);
 FirebaseApp app;
 WiFiClientSecure ssl_client;
-using AsyncClient = AsyncClientClass;
-AsyncClient aClient(ssl_client);
+// using AsyncClient = AsyncClientClass;
+// AsyncClient aClient(ssl_client);
+AsyncClientClass aClient(ssl_client);
 RealtimeDatabase Database;
+//////////////////////////////////////////////////////////////////////////////////////////////
 
 
 SemaphoreHandle_t sensorDataMutex;
@@ -76,10 +119,10 @@ TaskHandle_t sensorReadTaskHandle;
 TaskHandle_t firebaseTaskHandle;
 TaskHandle_t serialPrintTaskHandle;
 
-
 // NTP Client for time synchronization
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000); // Update every 60 seconds
+
 
 struct CalibrationData {
   float calibrationFactor;
@@ -87,7 +130,6 @@ struct CalibrationData {
   bool isValid;
 };
 
-// Sensor data structures
 struct BME680_Data {
   float temperature = NAN;
   float humidity = NAN;
@@ -140,7 +182,6 @@ struct HX711_Data {
   bool isValid = false;
 };
 
-// Combined sensor data structure
 struct CombinedSensorData {
   BME680_Data bme680;
   PMS7003_Data pms7003;
@@ -150,7 +191,6 @@ struct CombinedSensorData {
   HX711_Data hx711;
 };
 
-// PMS7003 sensor class
 class PMS7003 {
 private:
   HardwareSerial& _serial;
@@ -786,7 +826,6 @@ String getFormattedTime() {
   return String(buffer);
 }
 
-
 // FreeRTOS Task Functions
 void sensorReadTask(void *parameter) {
   SensorManager* sensorMgr = (SensorManager*)parameter;
@@ -1007,6 +1046,175 @@ void serialPrintTask(void *parameter) {
   }
 }
 
+String getWifiNetworkList() {
+  Serial.println("Scanning for WiFi networks...");
+  
+  // Scan in AP+STA mode (no need to switch modes)
+  WiFi.mode(WIFI_AP_STA);
+  
+  // Scan for networks
+  int n = WiFi.scanNetworks();
+  Serial.println("Scan completed");
+  
+  // Return to AP mode after scanning (but keep STA enabled if we're connected)
+  if (wifiConnected) {
+    WiFi.mode(WIFI_AP_STA);
+  } else {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+    WiFi.softAP(AP_SSID, AP_PASSWORD);
+  }
+  
+  String networkList = "";
+  
+  if (n == 0) {
+    networkList = "<option value=''>No networks found</option>";
+  } else {
+    // Create array to store networks (to avoid duplicates)
+    String networks[MAX_NETWORKS];
+    int networksCount = 0;
+    
+    for (int i = 0; i < n && networksCount < MAX_NETWORKS; i++) {
+      // Check if network is already in our list (avoid duplicates)
+      bool isDuplicate = false;
+      for (int j = 0; j < networksCount; j++) {
+        if (networks[j] == WiFi.SSID(i)) {
+          isDuplicate = true;
+          break;
+        }
+      }
+      
+      if (!isDuplicate && WiFi.SSID(i).length() > 0) {
+        // Add to our array
+        networks[networksCount] = WiFi.SSID(i);
+        networksCount++;
+        
+        // Add to option list with signal strength
+        networkList += "<option value='" + WiFi.SSID(i) + "'>" + WiFi.SSID(i);
+        networkList += " (";
+        
+        // Signal strength icon based on RSSI
+        int rssi = WiFi.RSSI(i);
+        if (rssi > -50) {
+          networkList += "Strong";
+        } else if (rssi > -70) {
+          networkList += "Good";
+        } else {
+          networkList += "Weak";
+        }
+        
+        // Add encryption type
+        networkList += ", ";
+        switch (WiFi.encryptionType(i)) {
+          case WIFI_AUTH_OPEN:
+            networkList += "Open";
+            break;
+          case WIFI_AUTH_WEP:
+            networkList += "WEP";
+            break;
+          case WIFI_AUTH_WPA_PSK:
+            networkList += "WPA";
+            break;
+          case WIFI_AUTH_WPA2_PSK:
+            networkList += "WPA2";
+            break;
+          case WIFI_AUTH_WPA_WPA2_PSK:
+            networkList += "WPA/WPA2";
+            break;
+          default:
+            networkList += "Unknown";
+        }
+        
+        networkList += ")</option>";
+      }
+    }
+  }
+  
+  return networkList;
+}
+
+bool loadWiFiCredentials(String &ssid, String &password) {
+  if (SPIFFS.exists(WIFI_FILE)) {
+    File file = SPIFFS.open(WIFI_FILE, "r");
+    if (file) {
+      StaticJsonDocument<256> doc;
+      DeserializationError error = deserializeJson(doc, file);
+      file.close();
+      
+      if (!error) {
+        ssid = doc["ssid"].as<String>();
+        password = doc["password"].as<String>();
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void saveWiFiCredentials(const String &ssid, const String &password) {
+  File file = SPIFFS.open(WIFI_FILE, "w");
+  if (file) {
+    StaticJsonDocument<256> doc;
+    doc["ssid"] = ssid;
+    doc["password"] = password;
+    serializeJson(doc, file);
+    file.close();
+    Serial.println("WiFi credentials saved");
+  } else {
+    Serial.println("Failed to open file for writing");
+  }
+}
+
+void setupServer() {
+  server.onNotFound([]() {
+    server.sendHeader("Location", "http://192.168.4.1/setup", true);
+    server.send(302, "text/plain", "");
+  });
+
+  server.on("/setup", HTTP_GET, []() {
+    String networkList = getWifiNetworkList();
+
+    String html = "<!DOCTYPE html>"
+                  "<html><head><title>ESP32 WiFi Setup</title>"
+                  "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+                  "<style>"
+                  "body{font-family:Arial,sans-serif;margin:0;padding:20px;text-align:center;background-color:#f5f5f5;}"
+                  "h1{color:#0066cc;margin-bottom:20px;}"
+                  ".container{max-width:400px;margin:0 auto;background-color:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}"
+                  "form{text-align:left;}"
+                  "label{display:block;margin:10px 0 5px;font-weight:bold;}"
+                  "select,input{width:100%;padding:10px;box-sizing:border-box;margin-bottom:15px;border:1px solid #ddd;border-radius:4px;}"
+                  "button{background-color:#0066cc;color:white;border:none;padding:12px 20px;cursor:pointer;border-radius:4px;width:100%;font-size:16px;}"
+                  "button:hover{background-color:#0055bb;}"
+                  ".status{margin-top:20px;padding:10px;border-radius:4px;}"
+                  ".loader{border:5px solid #f3f3f3;border-top:5px solid #3498db;border-radius:50%;width:30px;height:30px;animation:spin 2s linear infinite;margin:10px auto;display:none;}"
+                  "@keyframes spin{0%{transform:rotate(0deg);}100%{transform:rotate(360deg);}}"
+                  ".refresh-btn{background-color:#4CAF50;margin-bottom:15px;}"
+                  "</style></head>"
+                  "<body>"
+                  "<div class='container'>"
+                  "<h1>ESP32 WiFi Setup</h1>"
+                  "<button class='refresh-btn' onclick='location.reload()'>Refresh WiFi List</button>"
+                  "<form method='POST' action='/connect'>"
+                  "<label for='ssid'>Select WiFi Network:</label>"
+                  "<select id='ssid' name='ssid' required>" +
+                  networkList +
+                  "</select>"
+                  "<label for='password'>WiFi Password:</label>"
+                  "<input type='password' id='password' name='password'>"
+                  "<button type='submit'>Connect</button>"
+                  "</form>"
+                  "<div class='loader' id='loader'></div>"
+                  "<div class='status' id='status'></div>"
+                  "</div>"
+                  "</body></html>";
+
+    server.send(200, "text/html", html);
+  });
+
+  server.begin();
+}
+
 
 
 
@@ -1014,106 +1222,188 @@ void serialPrintTask(void *parameter) {
 
 
 void setup() {
+  // Basic initialization
   Serial.begin(115200);
   delay(2000);
-  Serial.println("Starting ESP32 Gas Sensor System with FreeRTOS");
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
 
-  // Create FreeRTOS objects
-  sensorDataMutex = xSemaphoreCreateMutex();
-  sensorDataQueue = xQueueCreate(5, sizeof(CombinedSensorData));
-  
-  if (sensorDataMutex == NULL || sensorDataQueue == NULL) {
-    Serial.println("Failed to create FreeRTOS objects!");
-    while(1);
+  // Initialize SPIFFS
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS Mount Failed");
+    blinkError(5);
+    ESP.restart();
   }
 
-  if (!sensorManager.begin()) {
-    Serial.println("Failed to initialize some sensors!");
+  // Start WiFi connection process
+  startNetwork();
+
+  // Only proceed with sensor initialization if WiFi is connected
+  if (wifiConnected) {
+    initializeSensors();
+    initializeFirebase();
+    startTasks();
+    Serial.println("System fully initialized");
+  } else {
+    Serial.println("System in limited operation mode (WiFi not connected)");
   }
-
-  // Check for manual calibration request
-  sensorManager.checkForCalibrationRequest();
-  
-  // Print current calibration info
-  sensorManager.printCalibrationInfo();
-
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to Wi-Fi");
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(300);
-  }
-  Serial.println();
-  Serial.print("Connected with IP: ");
-  Serial.println(WiFi.localIP());
-  
-  // Initialize NTP client
-  timeClient.begin();
-  Serial.println("Connecting to NTP server...");
-  while (!timeClient.update()) {
-    Serial.print(".");
-    timeClient.forceUpdate();
-    delay(500);
-  }
-  Serial.println("\nNTP time synchronized");
-  
-  if (!sensorManager.begin()) {
-    Serial.println("Failed to initialize some sensors!");
-  }
-
-  ssl_client.setInsecure();
-  ssl_client.setConnectionTimeout(5000);
-  ssl_client.setHandshakeTimeout(3000);
-  
-  initializeApp(aClient, app, getAuth(user_auth), processData, "🔐 authTask");
-  app.getApp<RealtimeDatabase>(Database);
-  Database.url(DATABASE_URL);
-  
-  Serial.println("Firebase initialization complete");
-
-  Serial.println("Warming up sensors...");
-  delay(20000);
-  Serial.println("Sensors ready");
-
-  // Create FreeRTOS tasks
-  xTaskCreatePinnedToCore(
-    sensorReadTask,           // Task function
-    "SensorRead",             // Task name
-    4096,                     // Stack size
-    &sensorManager,           // Parameter
-    2,                        // Priority (higher for sensor reading)
-    &sensorReadTaskHandle,    // Task handle
-    0                         // Core 0
-  );
-
-  xTaskCreatePinnedToCore(
-    firebaseTask,             // Task function
-    "FirebaseTask",           // Task name
-    8192,                     // Stack size (larger for network operations)
-    NULL,                     // Parameter
-    1,                        // Priority (lower than sensor reading)
-    &firebaseTaskHandle,      // Task handle
-    1                         // Core 1
-  );
-
-  xTaskCreatePinnedToCore(
-    serialPrintTask,          // Task function
-    "SerialPrint",            // Task name
-    3072,                     // Stack size
-    NULL,                     // Parameter
-    1,                        // Priority
-    &serialPrintTaskHandle,   // Task handle
-    0                         // Core 0
-  );
-
-  Serial.println("FreeRTOS tasks created successfully");
-  Serial.println("System ready! Send 't' for manual tare, 'i' for calibration info");
 }
 
+
 void loop() {
-  // Keep Firebase app loop running on main thread
+  // Handle WiFi connection monitoring
+  if (!wifiConnected && millis() - lastConnectionAttempt > connectionTimeout) {
+    Serial.println("WiFi connection timeout, restarting...");
+    ESP.restart();
+  }
+
+  // Main application loop
   app.loop();
-  
-  // Small delay to prevent watchdog issues
   delay(1000);
+}
+
+
+
+
+
+
+
+void startNetwork() {
+  String ssid, password;
+  if (loadWiFiCredentials(ssid, password)) {
+    Serial.println("Attempting WiFi connection...");
+    if (connectToWiFi(ssid, password)) {
+      wifiConnected = true;
+      Serial.println("WiFi connected");
+      startWebServer();
+      return;
+    }
+  }
+
+  // Fallback to AP mode
+  Serial.println("Starting WiFi Access Point");
+  setupWiFiAP();
+  setupCaptivePortal();
+  lastConnectionAttempt = millis();
+}
+
+void initializeSensors() {
+  Serial.println("Initializing sensors...");
+  if (!sensorManager.begin()) {
+    Serial.println("Sensor initialization failed!");
+    blinkError(3);
+  }
+  sensorManager.printCalibrationInfo();
+}
+
+void initializeFirebase() {
+  if (!wifiConnected) return;
+
+  Serial.println("Initializing Firebase...");
+  ssl_client.setInsecure();
+  initializeApp(aClient, app, getAuth(user_auth), processData, "authTask");
+
+  unsigned long authStart = millis();
+  while (!app.ready() && millis() - authStart < 10000) {
+    delay(100);
+  }
+
+  if (app.ready()) {
+    app.getApp<RealtimeDatabase>(Database);
+    Database.url(DATABASE_URL);
+    isDB = true;
+    Serial.println("Firebase ready");
+  } else {
+    Serial.println("Firebase init failed");
+    isDB = false;
+  }
+}
+
+void startTasks() {
+  Serial.println("Starting FreeRTOS tasks...");
+  xTaskCreatePinnedToCore(sensorReadTask, "SensorRead", 4096, &sensorManager, 2, &sensorReadTaskHandle, 0);
+  xTaskCreatePinnedToCore(firebaseTask, "FirebaseTask", 8192, NULL, 2, &firebaseTaskHandle, 1);
+  xTaskCreatePinnedToCore(serialPrintTask, "SerialPrint", 3072, NULL, 1, &serialPrintTaskHandle, 0);
+}
+
+void startWebServer() {
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/plain", "ESP32 Gas Sensor System");
+  });
+
+  // OTA Update Endpoint
+  ElegantOTA.begin(&server);
+
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void setupWiFiAP() {
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+void setupCaptivePortal() {
+  dnsServer.start(53, "*", WiFi.softAPIP());
+
+  server.on("/", HTTP_GET, []() {
+    server.sendHeader("Location", "/wifi", true);
+    server.send(302, "text/plain", "");
+  });
+
+  server.on("/wifi", HTTP_GET, []() {
+    File file = SPIFFS.open("/wifi_setup.html", "r");
+    if (file) {
+      server.streamFile(file, "text/html");
+      file.close();
+    } else {
+      server.send(500, "text/plain", "File not found");
+    }
+  });
+
+  server.on("/connect", HTTP_POST, []() {
+    if (server.hasArg("ssid")) {
+      String ssid = server.arg("ssid");
+      String password = server.hasArg("password") ? server.arg("password") : "";
+
+      saveWiFiCredentials(ssid, password);
+      server.send(200, "text/plain", "Credentials saved. Restarting...");
+      delay(1000);
+      ESP.restart();
+    } else {
+      server.send(400, "text/plain", "Missing SSID");
+    }
+  });
+
+  server.begin();
+}
+
+bool connectToWiFi(const String &ssid, const String &password) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), password.c_str());
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    delay(500);
+    Serial.print(".");
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN)); // Blink while connecting
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(LED_PIN, HIGH);
+    return true;
+  }
+  
+  digitalWrite(LED_PIN, LOW);
+  return false;
+}
+
+void blinkError(int count) {
+  for (int i = 0; i < count; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(200);
+    digitalWrite(LED_PIN, LOW);
+    delay(200);
+  }
 }

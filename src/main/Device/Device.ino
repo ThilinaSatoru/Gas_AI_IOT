@@ -51,9 +51,19 @@ String storedPassword = "";
 #define HX711_SCK_PIN 26  // Digital output
 
 // Calibration values
-#define MQ6_RO_CLEAN_AIR_FACTOR 10.0
+#define MQ6_RO_CLEAN_AIR_FACTOR 9.83
+#define MQ6_RL 10.0                  // Load resistance in kOhm
+#define MQ6_VCC 5.0                  // Operating voltage
 #define MQ7_RO_CLEAN_AIR_FACTOR 27.0
 #define HX711_CALIBRATION_FACTOR -2689.7 // -21667.333984  // -20933.333984  -37170.00
+
+// Update curve coefficients based on datasheet
+#define MQ6_LPG_CURVE_A 1000.0
+#define MQ6_LPG_CURVE_B -2.5
+#define MQ6_METHANE_CURVE_A 3000.0
+#define MQ6_METHANE_CURVE_B -2.2
+#define MQ6_BUTANE_CURVE_A 1500.0
+#define MQ6_BUTANE_CURVE_B -2.3
 
 // EEPROM addresses
 #define EEPROM_SIZE 512
@@ -495,18 +505,7 @@ private:
 
   void calibrateMQ6()
   {
-    float val = 0;
-    for (int i = 0; i < 10; i++)
-    {
-      val += analogRead(MQ6_ANALOG_PIN);
-      delay(50);
-    }
-    val = val / 10.0;
-    float voltage = val * (3.3 / 4095.0);
-    _mq6Ro = voltage / MQ6_RO_CLEAN_AIR_FACTOR;
-
-    Serial.print("MQ6 calibrated. Ro = ");
-    Serial.println(_mq6Ro);
+    Serial.println("MQ6 calibration skipped - using raw values");
   }
 
   void calibrateMQ7()
@@ -558,18 +557,32 @@ private:
   MQ6_Data readMQ6()
   {
     MQ6_Data data;
-
-    int rawValue = analogRead(MQ6_ANALOG_PIN);
-    float voltage = rawValue * (3.3 / 4095.0);
-    float rs = (3.3 - voltage) / voltage;
-    float ratio = rs / _mq6Ro;
-
+    
+    // Take multiple readings for stability
+    float rawValue = 0;
+    int samples = 5;
+    for (int i = 0; i < samples; i++)
+    {
+      rawValue += analogRead(MQ6_ANALOG_PIN);
+      delay(10);
+    }
+    rawValue = rawValue / samples;
+    
+    // Convert to voltage (5V reference)
+    float voltage = rawValue * (MQ6_VCC / 4095.0);
+    
+    // Store raw values
     data.rawValue = rawValue;
     data.voltage = voltage;
-    data.lpg = 1000.0 * pow(ratio, -2.5);
-    data.methane = 3000.0 * pow(ratio, -2.2);
-    data.butane = 1500.0 * pow(ratio, -2.3);
-    data.isValid = true; // Always valid
+    data.lpg = rawValue;      // Store raw value instead of calculated ppm
+    data.methane = voltage;   // Store voltage instead of calculated ppm
+    data.butane = 0;         // Not used
+    data.isValid = true;
+
+    // Debug output
+    Serial.println("MQ6 Readings:");
+    Serial.println("  Raw ADC: " + String(rawValue));
+    Serial.println("  Voltage: " + String(voltage) + "V");
 
     return data;
   }
@@ -677,10 +690,13 @@ public:
     _pmsSerial.begin(9600, SERIAL_8N1, PMS_RX_PIN, PMS_TX_PIN);
     Serial.println("PMS7003 serial initialized");
 
-    // Initialize MQ sensors (without calibration)
+    // Initialize MQ sensors with calibration
     pinMode(MQ6_ANALOG_PIN, INPUT);
     pinMode(MQ7_ANALOG_PIN, INPUT);
-    Serial.println("MQ sensors initialized (calibration skipped)");
+    Serial.println("MQ sensors initialized");
+
+    // Calibrate MQ6 sensor
+    calibrateMQ6();
 
     // Initialize MICS-4514
     pinMode(MICS4514_CO_PIN, INPUT);
@@ -914,65 +930,26 @@ void sensorReadTask(void *parameter)
   }
 }
 
-void pushToDatabase(const String &path, JsonDocument &jsonData, const String &taskName = "DB_Push")
+String getDeviceId()
 {
-  if (!app.ready())
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  String deviceId = "device_";
+  for (int i = 0; i < 6; i++)
   {
-    Serial.println("Firebase not ready. Cannot push data to " + path);
-    return;
+    if (mac[i] < 16)
+      deviceId += "0";
+    deviceId += String(mac[i], HEX);
   }
-
-  // Sanitize JSON document
-  JsonObject root = jsonData.as<JsonObject>();
-  for (JsonPair kv : root)
-  {
-    if (kv.value().is<float>())
-    {
-      float val = kv.value().as<float>();
-      if (isnan(val) || isinf(val) || val > 1e10)
-      {
-        Serial.println("Sanitizing invalid float for key " + String(kv.key().c_str()) + ": " + String(val));
-        root[kv.key()] = 999999.0;
-      }
-    }
-    else if (kv.value().is<JsonObject>())
-    {
-      JsonObject nested = kv.value().as<JsonObject>();
-      for (JsonPair nestedKv : nested)
-      {
-        if (nestedKv.value().is<float>())
-        {
-          float val = nestedKv.value().as<float>();
-          if (isnan(val) || isinf(val) || val > 1e10)
-          {
-            Serial.println("Sanitizing invalid nested float for key " + String(nestedKv.key().c_str()) + ": " + String(val));
-            nested[nestedKv.key()] = 999999.0;
-          }
-        }
-      }
-    }
-  }
-
-  String timestamp = getFormattedTime();
-  String dataPath = path + "/" + timestamp;
-
-  String jsonString;
-  serializeJson(jsonData, jsonString);
-
-  Serial.println("Pushing to path: " + dataPath);
-  Serial.println("JSON data: " + jsonString);
-
-  // Push the entire object at once instead of field by field
-  Database.set<object_t>(aClient, dataPath, object_t(jsonString), processData, taskName);
-
-  Serial.println("Pushed complete object for " + taskName);
+  return deviceId;
 }
 
 void firebaseTask(void *parameter)
 {
-  Serial.println("................................FireFireFireFireFireFireFireFireFireFireFireFireFireFireFireFireFireFire");
+  Serial.println("Starting Firebase task with consolidated data structure");
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xFrequency = pdMS_TO_TICKS(30000); // 30 seconds
+  String deviceId = getDeviceId();
 
   for (;;)
   {
@@ -993,107 +970,67 @@ void firebaseTask(void *parameter)
         continue;
       }
 
-      // BME680
-      {
-        StaticJsonDocument<128> bmeData;
-        bmeData["temperature"] = data.bme680.temperature;
-        bmeData["humidity"] = data.bme680.humidity;
-        bmeData["pressure"] = data.bme680.pressure;
-        bmeData["gas_resistance"] = data.bme680.gas_resistance;
-        bmeData["altitude"] = data.bme680.altitude;
-        if (isDB)
-        {
-          pushToDatabase("/sensor_data/bme680", bmeData, "BME680_PUSH");
-        }
-      }
+      // Create a single JSON document for all sensor data
+      StaticJsonDocument<1024> sensorData;
+      String timestamp = getFormattedTime();
+      String dataPath = "/sensor_data/" + deviceId + "/" + timestamp;
 
-      // PMS7003 - Always push cached data (should be valid from last good reading)
-      {
-        StaticJsonDocument<256> pmsData;
-        pmsData["pm1_0"] = data.pms7003.pm1_0;
-        pmsData["pm2_5"] = data.pms7003.pm2_5;
-        pmsData["pm10"] = data.pms7003.pm10;
-        pmsData["particles_0_3um"] = data.pms7003.particles_0_3um;
-        pmsData["particles_0_5um"] = data.pms7003.particles_0_5um;
-        pmsData["particles_1_0um"] = data.pms7003.particles_1_0um;
-        pmsData["particles_2_5um"] = data.pms7003.particles_2_5um;
-        pmsData["particles_5_0um"] = data.pms7003.particles_5_0um;
-        pmsData["particles_10_0um"] = data.pms7003.particles_10_0um;
-        if (isDB)
-        {
-          pushToDatabase("/sensor_data/pms7003", pmsData, "PMS7003_PUSH");
-        }
-        Serial.println("Pushed cached PMS7003 data: PM2.5=" + String(data.pms7003.pm2_5) +
-                       ", PM10=" + String(data.pms7003.pm10) +
-                       ", Valid=" + String(data.pms7003.isValid ? "Yes" : "No"));
-      }
+      // BME680 data
+      JsonObject bmeObj = sensorData.createNestedObject("bme680");
+      bmeObj["temperature"] = data.bme680.temperature;
+      bmeObj["humidity"] = data.bme680.humidity;
+      bmeObj["pressure"] = data.bme680.pressure;
+      bmeObj["gas_resistance"] = data.bme680.gas_resistance;
+      bmeObj["altitude"] = data.bme680.altitude;
 
-      // MQ6
-      {
-        StaticJsonDocument<128> mq6Data;
-        mq6Data["lpg"] = data.mq6.lpg;
-        mq6Data["methane"] = data.mq6.methane;
-        mq6Data["butane"] = data.mq6.butane;
-        mq6Data["voltage"] = data.mq6.voltage;
-        if (isDB)
-        {
-          pushToDatabase("/sensor_data/mq6", mq6Data, "MQ6_PUSH");
-        }
-      }
-
-      // MQ7
-      {
-        StaticJsonDocument<128> mq7Data;
-        float co_value = data.mq7.co;
-        if (co_value > 1000000)
-          co_value = 1000000;
-        mq7Data["co"] = co_value;
-        mq7Data["voltage"] = data.mq7.voltage;
-        if (isDB)
-        {
-          pushToDatabase("/sensor_data/mq7", mq7Data, "MQ7_PUSH");
-        }
-      }
-
-      // MICS4514
-      {
-        StaticJsonDocument<128> micsData;
-        micsData["co"] = data.mics4514.co;
-        micsData["no2"] = data.mics4514.no2;
-        micsData["co_voltage"] = data.mics4514.co_voltage;
-        micsData["no2_voltage"] = data.mics4514.no2_voltage;
-        if (isDB)
-        {
-          pushToDatabase("/sensor_data/mics4514", micsData, "MICS4514_PUSH");
-        }
-      }
-
-      // HX711
-      {
-        StaticJsonDocument<64> hx711Data;
-        hx711Data["weight"] = data.hx711.weight;
-        if (isDB)
-        {
-          pushToDatabase("/sensor_data/hx711", hx711Data, "HX711_PUSH");
-        }
-      }
-
-      // Summary
-      StaticJsonDocument<256> summaryData;
-      JsonObject bmeObj = summaryData.createNestedObject("bme");
-      bmeObj["temp"] = data.bme680.temperature;
-      bmeObj["hum"] = data.bme680.humidity;
-      JsonObject pmsObj = summaryData.createNestedObject("pms");
-      pmsObj["pm25"] = data.pms7003.pm2_5;
+      // PMS7003 data
+      JsonObject pmsObj = sensorData.createNestedObject("pms7003");
+      pmsObj["pm1_0"] = data.pms7003.pm1_0;
+      pmsObj["pm2_5"] = data.pms7003.pm2_5;
       pmsObj["pm10"] = data.pms7003.pm10;
-      summaryData["lpg"] = data.mq6.lpg;
-      summaryData["weight"] = data.hx711.weight;
+      pmsObj["particles_0_3um"] = data.pms7003.particles_0_3um;
+      pmsObj["particles_0_5um"] = data.pms7003.particles_0_5um;
+      pmsObj["particles_1_0um"] = data.pms7003.particles_1_0um;
+      pmsObj["particles_2_5um"] = data.pms7003.particles_2_5um;
+      pmsObj["particles_5_0um"] = data.pms7003.particles_5_0um;
+      pmsObj["particles_10_0um"] = data.pms7003.particles_10_0um;
+
+      // MQ6 data
+      JsonObject mq6Obj = sensorData.createNestedObject("mq6");
+      mq6Obj["lpg"] = data.mq6.lpg;
+      mq6Obj["methane"] = data.mq6.methane;
+      mq6Obj["butane"] = data.mq6.butane;
+      mq6Obj["voltage"] = data.mq6.voltage;
+
+      // MQ7 data
+      JsonObject mq7Obj = sensorData.createNestedObject("mq7");
+      float co_value = data.mq7.co;
+      if (co_value > 1000000)
+        co_value = 1000000;
+      mq7Obj["co"] = co_value;
+      mq7Obj["voltage"] = data.mq7.voltage;
+
+      // MICS4514 data
+      JsonObject micsObj = sensorData.createNestedObject("mics4514");
+      micsObj["co"] = data.mics4514.co;
+      micsObj["no2"] = data.mics4514.no2;
+      micsObj["co_voltage"] = data.mics4514.co_voltage;
+      micsObj["no2_voltage"] = data.mics4514.no2_voltage;
+
+      // HX711 data
+      JsonObject hx711Obj = sensorData.createNestedObject("hx711");
+      hx711Obj["weight"] = data.hx711.weight;
+
+      // Push the consolidated data to Firebase
       if (isDB)
       {
-        pushToDatabase("/sensor_summary", summaryData, "SUMMARY_PUSH");
+        String jsonString;
+        serializeJson(sensorData, jsonString);
+        Serial.println("Pushing to path: " + dataPath);
+        Serial.println("JSON data: " + jsonString);
+        Database.set<object_t>(aClient, dataPath, object_t(jsonString), processData, "SENSOR_DATA_PUSH");
+        Serial.println("=== Firebase Push Complete ===");
       }
-
-      Serial.println("=== Firebase Push Complete ===");
     }
 
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
@@ -1278,26 +1215,68 @@ bool connectToWiFi()
   String password = readStringFromEEPROM(PASS_ADDR, 64);
 
   if (ssid.length() == 0)
+  {
+    Serial.println("Error: Empty SSID found in EEPROM");
     return false;
+  }
 
+  Serial.println("Attempting to connect to WiFi...");
+  Serial.println("SSID: " + ssid);
+  Serial.println("Password length: " + String(password.length()));
+
+  // Disconnect from any existing connection
+  WiFi.disconnect(true);
+  delay(1000);
+
+  // Set WiFi mode to station
+  WiFi.mode(WIFI_STA);
+
+  // Begin connection
   WiFi.begin(ssid.c_str(), password.c_str());
 
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20)
+  int maxAttempts = 30; // Increased to 30 seconds
+  Serial.print("Connecting");
+
+  while (WiFi.status() != WL_CONNECTED && attempts < maxAttempts)
   {
     delay(1000);
     Serial.print(".");
     attempts++;
+
+    // Print connection status
+    switch (WiFi.status())
+    {
+    case WL_IDLE_STATUS:
+      Serial.println("\nWiFi idle");
+      break;
+    case WL_NO_SSID_AVAIL:
+      Serial.println("\nSSID not found");
+      return false;
+    case WL_CONNECT_FAILED:
+      Serial.println("\nConnection failed - wrong password");
+      return false;
+    case WL_CONNECTION_LOST:
+      Serial.println("\nConnection lost");
+      break;
+    case WL_DISCONNECTED:
+      Serial.println("\nDisconnected");
+      break;
+    }
   }
 
   if (WiFi.status() == WL_CONNECTED)
   {
-    Serial.println("\nWiFi connected!");
+    Serial.println("\nWiFi connected successfully!");
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
+    Serial.print("Signal strength (RSSI): ");
+    Serial.println(WiFi.RSSI());
     return true;
   }
 
+  Serial.println("\nFailed to connect to WiFi");
+  Serial.println("Last status: " + String(WiFi.status()));
   return false;
 }
 

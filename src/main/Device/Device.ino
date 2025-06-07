@@ -14,11 +14,17 @@
 #include <WiFiUdp.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include "FS.h"
+#include "SD.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
+
+// Forward declarations
+void processData(AsyncResult &aResult);
+String getDeviceId();
 
 // Firebase credentials
 #define Web_API_KEY "AIzaSyAaiE2hCxCOIzy39Gq_BW8KlD_bUSR6Tyw"
@@ -52,8 +58,8 @@ String storedPassword = "";
 
 // Calibration values
 #define MQ6_RO_CLEAN_AIR_FACTOR 9.83
-#define MQ6_RL 10.0                  // Load resistance in kOhm
-#define MQ6_VCC 5.0                  // Operating voltage
+#define MQ6_RL 10.0 // Load resistance in kOhm
+#define MQ6_VCC 5.0 // Operating voltage
 #define MQ7_RO_CLEAN_AIR_FACTOR 27.0
 #define HX711_CALIBRATION_FACTOR -2689.7 // -21667.333984  // -20933.333984  -37170.00
 
@@ -73,6 +79,22 @@ String storedPassword = "";
 #define CALIBRATION_FACTOR_ADDR 100 // 4 bytes for float (100–103)
 #define TARE_VALUE_ADDR 104         // 4 bytes for float (104–107)
 #define CALIBRATION_VALID_ADDR 108  // 1 byte for calibration valid flag (108)
+
+// SD Card pins
+#define SD_CS 15   // Chip Select pin
+#define SD_MOSI 13 // Master Out Slave In
+#define SD_MISO 12 // Master In Slave Out
+#define SD_SCK 14  // Serial Clock
+
+// SD Card file paths
+#define BACKUP_FILE "/sensor_backup.json"
+#define MAX_BACKUP_ENTRIES 1000
+
+// SD Card constants
+#define CARD_NONE 0
+#define CARD_MMC 1
+#define CARD_SD 2
+#define CARD_SDHC 3
 
 bool isDB = true;
 
@@ -557,7 +579,7 @@ private:
   MQ6_Data readMQ6()
   {
     MQ6_Data data;
-    
+
     // Take multiple readings for stability
     float rawValue = 0;
     int samples = 5;
@@ -567,16 +589,16 @@ private:
       delay(10);
     }
     rawValue = rawValue / samples;
-    
+
     // Convert to voltage (5V reference)
     float voltage = rawValue * (MQ6_VCC / 4095.0);
-    
+
     // Store raw values
     data.rawValue = rawValue;
     data.voltage = voltage;
-    data.lpg = rawValue;      // Store raw value instead of calculated ppm
-    data.methane = voltage;   // Store voltage instead of calculated ppm
-    data.butane = 0;         // Not used
+    data.lpg = rawValue;    // Store raw value instead of calculated ppm
+    data.methane = voltage; // Store voltage instead of calculated ppm
+    data.butane = 0;        // Not used
     data.isValid = true;
 
     // Debug output
@@ -656,6 +678,139 @@ private:
     return data;
   }
 
+  // SD Card backup functions
+  bool saveToSD(const String &timestamp, const CombinedSensorData &data)
+  {
+    if (!::SD.exists(BACKUP_FILE))
+    {
+      // Create new file with array start
+      File file = ::SD.open(BACKUP_FILE, FILE_WRITE);
+      if (!file)
+      {
+        Serial.println("Failed to create backup file");
+        return false;
+      }
+      file.println("[");
+      file.close();
+    }
+
+    // Append new data
+    File file = ::SD.open(BACKUP_FILE, FILE_APPEND);
+    if (!file)
+    {
+      Serial.println("Failed to open backup file for appending");
+      return false;
+    }
+
+    StaticJsonDocument<1024> doc;
+    doc["timestamp"] = timestamp;
+
+    // BME680
+    JsonObject bme = doc.createNestedObject("bme680");
+    bme["temperature"] = data.bme680.temperature;
+    bme["humidity"] = data.bme680.humidity;
+    bme["pressure"] = data.bme680.pressure;
+    bme["gas_resistance"] = data.bme680.gas_resistance;
+    bme["altitude"] = data.bme680.altitude;
+
+    // PMS7003
+    JsonObject pms = doc.createNestedObject("pms7003");
+    pms["pm1_0"] = data.pms7003.pm1_0;
+    pms["pm2_5"] = data.pms7003.pm2_5;
+    pms["pm10"] = data.pms7003.pm10;
+
+    // MQ6
+    JsonObject mq6 = doc.createNestedObject("mq6");
+    mq6["lpg"] = data.mq6.lpg;
+    mq6["methane"] = data.mq6.methane;
+    mq6["butane"] = data.mq6.butane;
+    mq6["voltage"] = data.mq6.voltage;
+
+    // MQ7
+    JsonObject mq7 = doc.createNestedObject("mq7");
+    mq7["co"] = data.mq7.co;
+    mq7["voltage"] = data.mq7.voltage;
+
+    // MICS4514
+    JsonObject mics = doc.createNestedObject("mics4514");
+    mics["co"] = data.mics4514.co;
+    mics["no2"] = data.mics4514.no2;
+    mics["co_voltage"] = data.mics4514.co_voltage;
+    mics["no2_voltage"] = data.mics4514.no2_voltage;
+
+    // HX711
+    JsonObject hx711 = doc.createNestedObject("hx711");
+    hx711["weight"] = data.hx711.weight;
+
+    String jsonString;
+    serializeJson(doc, jsonString);
+
+    // Add comma if not first entry
+    if (file.size() > 1)
+    {
+      file.print(",");
+    }
+    file.println(jsonString);
+    file.close();
+    return true;
+  }
+
+  bool pushBackupToFirebase()
+  {
+    if (!::SD.exists(BACKUP_FILE))
+    {
+      return true; // No backup to push
+    }
+
+    File file = ::SD.open(BACKUP_FILE);
+    if (!file)
+    {
+      Serial.println("Failed to open backup file for reading");
+      return false;
+    }
+
+    // Read the entire file
+    String content = file.readString();
+    file.close();
+
+    // Parse the JSON array
+    DynamicJsonDocument doc(1024 * MAX_BACKUP_ENTRIES);
+    DeserializationError error = deserializeJson(doc, content);
+
+    if (error)
+    {
+      Serial.println("Failed to parse backup file");
+      return false;
+    }
+
+    JsonArray array = doc.as<JsonArray>();
+    String deviceId = getDeviceId();
+    bool success = true;
+
+    // Push each entry to Firebase
+    for (JsonObject entry : array)
+    {
+      String timestamp = entry["timestamp"].as<String>();
+      String path = "/sensor_data/" + deviceId + "/" + timestamp;
+
+      if (!Database.set<object_t>(aClient, path, object_t(entry), processData, "BACKUP_PUSH"))
+      {
+        success = false;
+        break;
+      }
+      delay(100); // Small delay between pushes
+    }
+
+    // If all successful, delete the backup file
+    if (success)
+    {
+      ::SD.remove(BACKUP_FILE);
+      Serial.println("Backup data successfully pushed to Firebase");
+    }
+
+    return success;
+  }
+
 public:
   SensorManager() : _pmsSerial(2),
                     _pmsSensor(_pmsSerial, PMS_RX_PIN, PMS_TX_PIN),
@@ -665,6 +820,28 @@ public:
   bool begin()
   {
     bool success = true;
+
+    // Initialize SD Card
+    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    if (!::SD.begin(SD_CS))
+    {
+      Serial.println("SD Card Mount Failed");
+      success = false;
+    }
+    else
+    {
+      uint8_t cardType = ::SD.cardType();
+      if (cardType == CARD_NONE)
+      {
+        Serial.println("No SD card attached");
+        success = false;
+      }
+      else
+      {
+        uint64_t cardSize = ::SD.cardSize() / (1024 * 1024);
+        Serial.printf("SD Card Size: %lluMB\n", cardSize);
+      }
+    }
 
     // Load calibration data
     loadCalibrationFromEEPROM();
@@ -870,6 +1047,90 @@ public:
     }
     return data;
   }
+
+  void handleFirebasePush(const String &timestamp, const CombinedSensorData &data)
+  {
+    if (!app.ready())
+    {
+      // Network down, save to SD
+      if (saveToSD(timestamp, data))
+      {
+        Serial.println("Data saved to SD card due to network interruption");
+      }
+      return;
+    }
+
+    // If we have backup data and network is up, try to push it
+    if (::SD.exists(BACKUP_FILE))
+    {
+      if (pushBackupToFirebase())
+      {
+        Serial.println("Backup data successfully pushed to Firebase");
+      }
+    }
+
+    // Push current data
+    StaticJsonDocument<1024> sensorData;
+    String deviceId = getDeviceId();
+    String dataPath = "/sensor_data/" + deviceId + "/" + timestamp;
+
+    // BME680 data
+    JsonObject bmeObj = sensorData.createNestedObject("bme680");
+    bmeObj["temperature"] = data.bme680.temperature;
+    bmeObj["humidity"] = data.bme680.humidity;
+    bmeObj["pressure"] = data.bme680.pressure;
+    bmeObj["gas_resistance"] = data.bme680.gas_resistance;
+    bmeObj["altitude"] = data.bme680.altitude;
+
+    // PMS7003 data
+    JsonObject pmsObj = sensorData.createNestedObject("pms7003");
+    pmsObj["pm1_0"] = data.pms7003.pm1_0;
+    pmsObj["pm2_5"] = data.pms7003.pm2_5;
+    pmsObj["pm10"] = data.pms7003.pm10;
+    pmsObj["particles_0_3um"] = data.pms7003.particles_0_3um;
+    pmsObj["particles_0_5um"] = data.pms7003.particles_0_5um;
+    pmsObj["particles_1_0um"] = data.pms7003.particles_1_0um;
+    pmsObj["particles_2_5um"] = data.pms7003.particles_2_5um;
+    pmsObj["particles_5_0um"] = data.pms7003.particles_5_0um;
+    pmsObj["particles_10_0um"] = data.pms7003.particles_10_0um;
+
+    // MQ6 data
+    JsonObject mq6Obj = sensorData.createNestedObject("mq6");
+    mq6Obj["lpg"] = data.mq6.lpg;
+    mq6Obj["methane"] = data.mq6.methane;
+    mq6Obj["butane"] = data.mq6.butane;
+    mq6Obj["voltage"] = data.mq6.voltage;
+
+    // MQ7 data
+    JsonObject mq7Obj = sensorData.createNestedObject("mq7");
+    float co_value = data.mq7.co;
+    if (co_value > 1000000)
+      co_value = 1000000;
+    mq7Obj["co"] = co_value;
+    mq7Obj["voltage"] = data.mq7.voltage;
+
+    // MICS4514 data
+    JsonObject micsObj = sensorData.createNestedObject("mics4514");
+    micsObj["co"] = data.mics4514.co;
+    micsObj["no2"] = data.mics4514.no2;
+    micsObj["co_voltage"] = data.mics4514.co_voltage;
+    micsObj["no2_voltage"] = data.mics4514.no2_voltage;
+
+    // HX711 data
+    JsonObject hx711Obj = sensorData.createNestedObject("hx711");
+    hx711Obj["weight"] = data.hx711.weight;
+
+    // Push the consolidated data to Firebase
+    if (isDB)
+    {
+      String jsonString;
+      serializeJson(sensorData, jsonString);
+      Serial.println("Pushing to path: " + dataPath);
+      Serial.println("JSON data: " + jsonString);
+      Database.set<object_t>(aClient, dataPath, object_t(jsonString), processData, "SENSOR_DATA_PUSH");
+      Serial.println("=== Firebase Push Complete ===");
+    }
+  }
 };
 
 SensorManager sensorManager;
@@ -953,85 +1214,26 @@ void firebaseTask(void *parameter)
 
   for (;;)
   {
-    if (app.ready())
+    CombinedSensorData data;
+
+    // Get cached sensor data with mutex protection
+    if (xSemaphoreTake(cachedDataMutex, pdMS_TO_TICKS(500)) == pdTRUE)
     {
-      CombinedSensorData data;
-
-      // Get cached sensor data with mutex protection
-      if (xSemaphoreTake(cachedDataMutex, pdMS_TO_TICKS(500)) == pdTRUE)
-      {
-        data = cachedSensorData;
-        xSemaphoreGive(cachedDataMutex);
-      }
-      else
-      {
-        Serial.println("Failed to get cached sensor data for Firebase push");
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
-        continue;
-      }
-
-      // Create a single JSON document for all sensor data
-      StaticJsonDocument<1024> sensorData;
-      String timestamp = getFormattedTime();
-      String dataPath = "/sensor_data/" + deviceId + "/" + timestamp;
-
-      // BME680 data
-      JsonObject bmeObj = sensorData.createNestedObject("bme680");
-      bmeObj["temperature"] = data.bme680.temperature;
-      bmeObj["humidity"] = data.bme680.humidity;
-      bmeObj["pressure"] = data.bme680.pressure;
-      bmeObj["gas_resistance"] = data.bme680.gas_resistance;
-      bmeObj["altitude"] = data.bme680.altitude;
-
-      // PMS7003 data
-      JsonObject pmsObj = sensorData.createNestedObject("pms7003");
-      pmsObj["pm1_0"] = data.pms7003.pm1_0;
-      pmsObj["pm2_5"] = data.pms7003.pm2_5;
-      pmsObj["pm10"] = data.pms7003.pm10;
-      pmsObj["particles_0_3um"] = data.pms7003.particles_0_3um;
-      pmsObj["particles_0_5um"] = data.pms7003.particles_0_5um;
-      pmsObj["particles_1_0um"] = data.pms7003.particles_1_0um;
-      pmsObj["particles_2_5um"] = data.pms7003.particles_2_5um;
-      pmsObj["particles_5_0um"] = data.pms7003.particles_5_0um;
-      pmsObj["particles_10_0um"] = data.pms7003.particles_10_0um;
-
-      // MQ6 data
-      JsonObject mq6Obj = sensorData.createNestedObject("mq6");
-      mq6Obj["lpg"] = data.mq6.lpg;
-      mq6Obj["methane"] = data.mq6.methane;
-      mq6Obj["butane"] = data.mq6.butane;
-      mq6Obj["voltage"] = data.mq6.voltage;
-
-      // MQ7 data
-      JsonObject mq7Obj = sensorData.createNestedObject("mq7");
-      float co_value = data.mq7.co;
-      if (co_value > 1000000)
-        co_value = 1000000;
-      mq7Obj["co"] = co_value;
-      mq7Obj["voltage"] = data.mq7.voltage;
-
-      // MICS4514 data
-      JsonObject micsObj = sensorData.createNestedObject("mics4514");
-      micsObj["co"] = data.mics4514.co;
-      micsObj["no2"] = data.mics4514.no2;
-      micsObj["co_voltage"] = data.mics4514.co_voltage;
-      micsObj["no2_voltage"] = data.mics4514.no2_voltage;
-
-      // HX711 data
-      JsonObject hx711Obj = sensorData.createNestedObject("hx711");
-      hx711Obj["weight"] = data.hx711.weight;
-
-      // Push the consolidated data to Firebase
-      if (isDB)
-      {
-        String jsonString;
-        serializeJson(sensorData, jsonString);
-        Serial.println("Pushing to path: " + dataPath);
-        Serial.println("JSON data: " + jsonString);
-        Database.set<object_t>(aClient, dataPath, object_t(jsonString), processData, "SENSOR_DATA_PUSH");
-        Serial.println("=== Firebase Push Complete ===");
-      }
+      data = cachedSensorData;
+      xSemaphoreGive(cachedDataMutex);
     }
+    else
+    {
+      Serial.println("Failed to get cached sensor data for Firebase push");
+      vTaskDelayUntil(&xLastWakeTime, xFrequency);
+      continue;
+    }
+
+    // Get current timestamp
+    String timestamp = getFormattedTime();
+
+    // Handle Firebase push with backup
+    sensorManager.handleFirebasePush(timestamp, data);
 
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
   }

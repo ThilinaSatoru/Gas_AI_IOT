@@ -21,10 +21,11 @@
 #include "freertos/queue.h"
 
 // Firebase credentials
-#define Web_API_KEY "AIzaSyAaiE2hCxCOIzy39Gq_BW8KlD_bUSR6Tyw"
-#define DATABASE_URL "https://esp-gas-ai-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define Web_API_KEY "AIzaSyD0b2OZ9H1Pq3mrL3XJTpIiDlqBKrBiTe8"
+#define DATABASE_URL "https://smart-lpg-manager-3d9d1-default-rtdb.asia-southeast1.firebasedatabase.app"
 #define USER_EMAIL "satoru.thilina@gmail.com"
 #define USER_PASS "123456"
+#define DEVICE_ID "001"
 
 String storedSSID = "";
 String storedPassword = "";
@@ -52,8 +53,8 @@ String storedPassword = "";
 
 // Calibration values
 #define MQ6_RO_CLEAN_AIR_FACTOR 9.83
-#define MQ6_RL 10.0                  // Load resistance in kOhm
-#define MQ6_VCC 5.0                  // Operating voltage
+#define MQ6_RL 10.0 // Load resistance in kOhm
+#define MQ6_VCC 5.0 // Operating voltage
 #define MQ7_RO_CLEAN_AIR_FACTOR 27.0
 #define HX711_CALIBRATION_FACTOR -2689.7 // -21667.333984  // -20933.333984  -37170.00
 
@@ -557,7 +558,7 @@ private:
   MQ6_Data readMQ6()
   {
     MQ6_Data data;
-    
+
     // Take multiple readings for stability
     float rawValue = 0;
     int samples = 5;
@@ -567,16 +568,16 @@ private:
       delay(10);
     }
     rawValue = rawValue / samples;
-    
+
     // Convert to voltage (5V reference)
     float voltage = rawValue * (MQ6_VCC / 4095.0);
-    
+
     // Store raw values
     data.rawValue = rawValue;
     data.voltage = voltage;
-    data.lpg = rawValue;      // Store raw value instead of calculated ppm
-    data.methane = voltage;   // Store voltage instead of calculated ppm
-    data.butane = 0;         // Not used
+    data.lpg = rawValue;    // Store raw value instead of calculated ppm
+    data.methane = voltage; // Store voltage instead of calculated ppm
+    data.butane = 0;        // Not used
     data.isValid = true;
 
     // Debug output
@@ -932,16 +933,7 @@ void sensorReadTask(void *parameter)
 
 String getDeviceId()
 {
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
-  String deviceId = "device_";
-  for (int i = 0; i < 6; i++)
-  {
-    if (mac[i] < 16)
-      deviceId += "0";
-    deviceId += String(mac[i], HEX);
-  }
-  return deviceId;
+  return "device_" + String(DEVICE_ID);
 }
 
 void firebaseTask(void *parameter)
